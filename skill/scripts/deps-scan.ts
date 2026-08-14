@@ -8,7 +8,8 @@
  *   bun deps-scan.ts [--cwd <path>] [--json] [--no-net] [--no-why]
  *
  *   --no-net   не ходить в registry (только расхождения версий, пиннинг, overrides)
- *   --no-why   не запускать `bun why` для overrides (быстрее, но без вердиктов)
+ *   --no-why   не читать установленное дерево (`bun pm ls --all`) и не запускать `bun why`
+ *              для overrides: быстрее, но без вердиктов и без фактических версий
  */
 
 type SemVer = { major: number; minor: number; patch: number; pre: string | null };
@@ -139,7 +140,7 @@ type Risk = 'up-to-date' | 'patch' | 'minor' | 'major' | 'zero-minor-breaking' |
 /**
  * Класс риска перехода from → to.
  * Ключевой нюанс: при major === 0 semver-гарантий нет, минор = мажор
- * (0.35.x → 0.36.0 ломает так же, как 1.x → 2.0), а при 0.0.x ломает даже патч.
+ * (смена минора ломает так же, как 1.x → 2.0), а при 0.0.x ломает даже патч.
  */
 function riskClass(from: SemVer, to: SemVer): Risk {
   const c = compare(from, to);
@@ -289,21 +290,57 @@ if (useNet) {
 
 const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
 
+/**
+ * Все установленные копии каждого пакета из `bun pm ls --all` — один вызов на весь скан.
+ *
+ * Копий может быть несколько: одна ветка дерева тянет 1.x, другая 5.x. Спрашивать версию
+ * у `bun why` нельзя — он печатает копии подряд, и любой «первый матч» врёт про остальные.
+ */
+async function installedTree(): Promise<Map<string, string[]>> {
+  const proc = Bun.spawn(['bun', 'pm', 'ls', '--all'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+  const out = stripAnsi(await new Response(proc.stdout).text());
+  await proc.exited;
+
+  const found = new Map<string, Set<string>>();
+  for (const raw of out.split('\n')) {
+    const line = raw.replace(/^[\s│├└─]+/, '').trim();
+    // Жадная первая группа отдаёт последний `@`, поэтому `@scope/pkg@1.2.3` режется верно.
+    const m = /^(.+)@([0-9][^@\s]*)$/.exec(line);
+    if (!m) continue;
+    const versions = found.get(m[1]!) ?? new Set<string>();
+    versions.add(m[2]!);
+    found.set(m[1]!, versions);
+  }
+
+  const sortVersions = (a: string, b: string) => {
+    const [pa, pb] = [parseVersion(a), parseVersion(b)];
+    return pa && pb ? compare(pa, pb) : a.localeCompare(b);
+  };
+  return new Map([...found].map(([name, versions]) => [name, [...versions].sort(sortVersions)]));
+}
+
 /** Диапазоны родителей из `bun why <pkg> --top`. */
-async function parentRanges(name: string): Promise<{ installed: string | null; ranges: string[] }> {
+async function parentRanges(name: string): Promise<string[]> {
   const proc = Bun.spawn(['bun', 'why', name, '--top'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
   const out = stripAnsi(await new Response(proc.stdout).text());
   await proc.exited;
-  const installed = /^\s*\S+@(\S+)\s*$/m.exec(out)?.[1] ?? null;
-  const ranges = [...out.matchAll(/\(requires ([^)]+)\)/g)].map((m) => m[1]!.trim());
-  return { installed, ranges: [...new Set(ranges)] };
+  return [...new Set([...out.matchAll(/\(requires ([^)]+)\)/g)].map((m) => m[1]!.trim()))];
 }
+
+const installed = useWhy ? await installedTree() : new Map<string, string[]>();
+const copiesOf = (name: string) => installed.get(name) ?? [];
+const maxInstalled = (name: string): SemVer | null => {
+  const parsed = copiesOf(name)
+    .map(parseVersion)
+    .filter((v): v is SemVer => v !== null);
+  return parsed.length ? parsed.reduce((a, b) => (compare(a, b) > 0 ? a : b)) : null;
+};
 
 type OverrideVerdict = {
   name: string;
   spec: string;
-  installed: string | null;
-  verdict: 'REDUNDANT_NOW' | 'RAISES_FLOOR' | 'BREAKS_CEILING' | 'UNKNOWN';
+  copies: string[];
+  verdict: 'REDUNDANT_NOW' | 'RAISES_FLOOR' | 'BREAKS_CEILING' | 'NOT_APPLIED' | 'UNKNOWN';
   gap: Risk | null;
   parents: string[];
   alsoDirect: boolean;
@@ -331,14 +368,21 @@ for (const [name, spec] of Object.entries(overrides)) {
   const alsoDirect = deps.has(name);
 
   if (!useWhy || !overrideFloor) {
-    overrideReport.push({ name, spec, installed: null, verdict: 'UNKNOWN', gap: null, parents: [], alsoDirect });
+    overrideReport.push({ name, spec, copies: copiesOf(name), verdict: 'UNKNOWN', gap: null, parents: [], alsoDirect });
     continue;
   }
 
-  const { installed, ranges } = await parentRanges(name);
-  const installedVer = installed ? parseVersion(installed) : null;
+  const ranges = await parentRanges(name);
+  const copies = copiesOf(name);
+  const installedVer = maxInstalled(name);
   // Разрыв мерим до фактически стоящей версии: именно её родитель и не заказывал.
   const target = installedVer && compare(installedVer, overrideFloor) > 0 ? installedVer : overrideFloor;
+  // Ни одна копия не удовлетворяет override — он не доехал до дерева (устаревший lockfile
+  // либо ветки, которые Bun не переопределил). Диапазонные вердикты тут бессмысленны.
+  const notApplied = copies.length > 0 && !copies.some((v) => {
+    const parsedCopy = parseVersion(v);
+    return parsedCopy !== null && allows(parsed, parsedCopy);
+  });
   let ceilingBroken = false;
   let floorRaised = false;
   let gap: Risk | null = null;
@@ -358,8 +402,16 @@ for (const [name, spec] of Object.entries(overrides)) {
   overrideReport.push({
     name,
     spec,
-    installed,
-    verdict: ranges.length === 0 ? 'UNKNOWN' : ceilingBroken ? 'BREAKS_CEILING' : floorRaised ? 'RAISES_FLOOR' : 'REDUNDANT_NOW',
+    copies,
+    verdict: notApplied
+      ? 'NOT_APPLIED'
+      : ranges.length === 0
+        ? 'UNKNOWN'
+        : ceilingBroken
+          ? 'BREAKS_CEILING'
+          : floorRaised
+            ? 'RAISES_FLOOR'
+            : 'REDUNDANT_NOW',
     gap,
     parents: ranges,
     alsoDirect,
@@ -372,6 +424,8 @@ type Row = {
   mismatch: boolean;
   pinned: boolean;
   floor: string | null;
+  copies: string[];
+  atLatest: boolean;
   inRangeMax: string | null;
   latest: string | null;
   risk: Risk | 'unknown';
@@ -411,6 +465,7 @@ for (const name of external) {
   }, null);
 
   const inRangeMax = info && widest ? maxSatisfying(info.versions, widest) : null;
+  const installedMax = maxInstalled(name);
 
   rows.push({
     name,
@@ -418,6 +473,8 @@ for (const name of external) {
     mismatch: specs.length > 1,
     pinned,
     floor: floor ? fmt(floor) : null,
+    copies: copiesOf(name),
+    atLatest: !!(installedMax && info?.latest && compare(installedMax, info.latest) >= 0),
     inRangeMax: inRangeMax ? fmt(inRangeMax) : null,
     latest: info?.latestRaw ?? null,
     risk: floor && info?.latest ? riskClass(floor, info.latest) : 'unknown',
@@ -447,6 +504,7 @@ line(`- корень: \`${root}\``);
 line(`- package.json просканировано: ${pkgPaths.size} (воркспейсов: ${pkgPaths.size - 1})`);
 line(`- внешних зависимостей: ${external.length}, overrides/resolutions: ${Object.keys(overrides).length}`);
 if (!useNet) line('- **--no-net**: latest не запрашивался, риск-классы недоступны');
+if (!useWhy) line('- **--no-why**: установленное дерево не читалось, колонки «Установлено»/«Копии» пустые');
 line();
 
 const mismatches = rows.filter((r) => r.mismatch);
@@ -471,25 +529,53 @@ if (mismatches.length === 0) {
 }
 line();
 
+const declaredDupes = rows.filter((r) => r.copies.length > 1);
+const transitiveDupes = [...installed].filter(
+  ([name, versions]) => versions.length > 1 && !rows.some((r) => r.name === name) && !overrides[name],
+).length;
+
+line(`## 2. Дубли в дереве (${declaredDupes.length})`);
+line();
+if (!useWhy) {
+  line('Дерево не читалось (`--no-why`) — дубли не проверялись.');
+} else if (declaredDupes.length === 0) {
+  line('Нет: у объявленных зависимостей по одной копии.');
+} else {
+  line('Объявленный пакет стоит в дереве в нескольких версиях — обычно из-за расхождения диапазонов');
+  line('или чужого exact-требования. Это лишний вес, а для рантайм-библиотек (синглтоны, инстансы,');
+  line('`instanceof`) — источник багов.');
+  line();
+  for (const r of declaredDupes) line(`- **${r.name}**: ${r.copies.join(' + ')} — объявлено ${r.specs.map((s) => `\`${s}\``).join(', ')}`);
+}
+if (transitiveDupes > 0) {
+  line();
+  line(`Транзитивных пакетов с несколькими копиями: ${transitiveDupes} — обычно норма, смотреть точечно (\`bun why <pkg>\`).`);
+}
+line();
+
 const candidates = rows
   .filter((r) => r.risk !== 'up-to-date' && r.risk !== 'unknown')
   .sort((a, b) => (RISK_ORDER[a.risk]! - RISK_ORDER[b.risk]!) || a.name.localeCompare(b.name));
 
-line(`## 2. Кандидаты на обновление (${candidates.length})`);
+line(`## 3. Кандидаты на обновление (${candidates.length})`);
 line();
 if (candidates.length === 0) {
   line('Нет: всё на latest.');
 } else {
-  line('| Пакет | Сейчас | Макс. в диапазоне | Latest | Класс | Семейство | В overrides | Воркспейсы |');
-  line('|---|---|---|---|---|---|---|---|');
+  line('| Пакет | Диапазон | Установлено | Макс. в диапазоне | Latest | Класс | Семейство | В overrides | Воркспейсы |');
+  line('|---|---|---|---|---|---|---|---|---|');
   for (const r of candidates) {
     const inRange = r.inRangeMax && r.inRangeMax !== r.floor ? `**${r.inRangeMax}**` : (r.inRangeMax ?? '—');
+    const copies = r.copies.length ? r.copies.join(' + ') + (r.copies.length > 1 ? ' ⚠' : '') : '—';
     line(
-      `| ${r.name}${r.pinned ? ' 📌' : ''} | ${r.specs.join(', ')} | ${inRange} | ${r.latest ?? '—'} | ${RISK_LABEL[r.risk]} | ${r.family ?? '—'} | ${r.inOverrides ? `\`${r.inOverrides}\`` : '—'} | ${r.workspaces.join(', ')} |`,
+      `| ${r.name}${r.pinned ? ' 📌' : ''} | ${r.specs.join(', ')} | ${copies} | ${inRange} | ${r.latest ?? '—'} | ${RISK_LABEL[r.risk]}${r.atLatest ? ' *(latest уже стоит)*' : ''} | ${r.family ?? '—'} | ${r.inOverrides ? `\`${r.inOverrides}\`` : '—'} | ${r.workspaces.join(', ')} |`,
     );
   }
   line();
   line('📌 — точный пиннинг (без `^`): сделано намеренно, диапазон не расширять.');
+  line('«Диапазон» — то, что записано в package.json; «Установлено» — что реально в дереве (`bun pm ls --all`).');
+  line('*(latest уже стоит)* — обновлять нечего, правка диапазона лишь приводит запись в соответствие факту.');
+  line('⚠ — в дереве несколько копий пакета: разные ветки тянут разные версии.');
   line('Жирный «макс. в диапазоне» — подтянется само при пересборке lockfile, даже без правки package.json.');
 }
 line();
@@ -503,7 +589,7 @@ for (const r of rows) {
 }
 const groups = [...families.entries()].filter(([, list]) => list.length > 1 && list.some((r) => candidates.includes(r)));
 
-line(`## 3. Семейства — обновлять только целиком (${groups.length})`);
+line(`## 4. Семейства — обновлять только целиком (${groups.length})`);
 line();
 if (groups.length === 0) {
   line('Нет затронутых семейств.');
@@ -515,23 +601,32 @@ if (groups.length === 0) {
 }
 line();
 
-line(`## 4. Overrides / resolutions (${overrideReport.length})`);
+line(`## 5. Overrides / resolutions (${overrideReport.length})`);
 line();
 if (overrideReport.length === 0) {
   line('Нет.');
 } else {
-  line('| Пакет | Override | Установлено | Вердикт | Разрыв с родителем | Прямая зависимость тоже |');
+  line('| Пакет | Override | Копии в дереве | Вердикт | Разрыв с родителем | Прямая зависимость тоже |');
   line('|---|---|---|---|---|---|');
   for (const o of overrideReport) {
+    const copies = o.copies.length ? o.copies.join(' + ') + (o.copies.length > 1 ? ' ⚠' : '') : '—';
     line(
-      `| ${o.name} | \`${o.spec}\` | ${o.installed ?? '—'} | ${o.verdict} | ${o.gap ? RISK_LABEL[o.gap] : '—'} | ${o.alsoDirect ? '**да, синхронизировать**' : 'нет'} |`,
+      `| ${o.name} | \`${o.spec}\` | ${copies} | ${o.verdict} | ${o.gap ? RISK_LABEL[o.gap] : '—'} | ${o.alsoDirect ? '**да, синхронизировать**' : 'нет'} |`,
     );
   }
   line();
-  line('- `REDUNDANT_NOW` — родители сами требуют не меньше: кандидат на удаление (проверить `bun audit` после).');
-  line('- `RAISES_FLOOR` — поднимает минимум внутри допустимого родителями диапазона: обычный security-override, держать.');
-  line('- `BREAKS_CEILING` — форсит версию выше той, что родитель считает совместимой: держать, но это риск API. Разрыв в мажор — красный флаг.');
+  line('**Вердикты ниже — гипотезы по диапазонам, а не факт.** Диапазоны родителей не говорят, что');
+  line('override реально делает с деревом: Bun переопределяет не все ветки. Решает эксперимент —');
+  line('снять все overrides разом, пересобрать, сравнить `bun audit` и копии (процедура в SKILL.md).');
+  line();
+  line('- `REDUNDANT_NOW` — родители сами требуют не меньше: кандидат на удаление.');
+  line('- `RAISES_FLOOR` — поднимает минимум внутри допустимого родителями диапазона: похоже на security-override.');
+  line('- `BREAKS_CEILING` — форсит версию выше той, что родитель считает совместимой. Часто фикция: если рядом');
+  line('  стоит ⚠, старая копия всё равно осталась в дереве — потолок не сломан, override до неё не достал.');
+  line('- `NOT_APPLIED` — ни одна установленная копия не попадает в override: lockfile разошёлся с package.json');
+  line('  (нужен `bun install`) либо Bun эту ветку не переопределил. Вердикт по диапазонам тут не считается.');
   line('- `UNKNOWN` — диапазон не разобран или `bun why` без родителей.');
+  line('- ⚠ — копий несколько: override не схлопнул дерево, часть веток живёт на своей версии.');
   line();
   for (const o of overrideReport.filter((x) => x.parents.length)) {
     line(`- ${o.name}: родители требуют ${o.parents.map((p) => `\`${p}\``).join(', ')}`);
@@ -541,7 +636,7 @@ line();
 
 const deprecated = rows.filter((r) => r.deprecated);
 if (deprecated.length) {
-  line(`## 5. Deprecated latest (${deprecated.length})`);
+  line(`## 6. Deprecated latest (${deprecated.length})`);
   line();
   for (const r of deprecated) line(`- **${r.name}**: ${r.deprecated}`);
   line();
@@ -549,7 +644,7 @@ if (deprecated.length) {
 
 const notes = rows.filter((r) => r.note);
 if (notes.length) {
-  line(`## 6. Требует ручной проверки (${notes.length})`);
+  line(`## 7. Требует ручной проверки (${notes.length})`);
   line();
   for (const r of notes) line(`- **${r.name}** (${r.specs.join(', ')}): ${r.note}`);
   line();
