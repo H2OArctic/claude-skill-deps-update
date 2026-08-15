@@ -10,6 +10,7 @@
  *   --no-net   не ходить в registry (только расхождения версий, пиннинг, overrides)
  *   --no-why   не читать установленное дерево (`bun pm ls --all`) и не запускать `bun why`
  *              для overrides: быстрее, но без вердиктов и без фактических версий
+ *   --decisions <path>  журнал отложенных решений (по умолчанию <root>/.claude/deps-update.json)
  */
 
 type SemVer = { major: number; minor: number; patch: number; pre: string | null };
@@ -46,15 +47,11 @@ const FAMILY_ALIASES: Record<string, string> = {
   vue: '@vue',
   nuxt: '@nuxt',
   svelte: '@sveltejs',
-  prisma: '@prisma',
-  payload: '@payloadcms',
-  elysia: '@elysiajs',
   eslint: '@eslint',
   storybook: '@storybook',
+  jest: '@jest',
   tailwindcss: 'tailwind',
   '@tailwindcss/postcss': 'tailwind',
-  typechain: 'typechain',
-  '@typechain/ethers-v6': 'typechain',
 };
 
 const args = Bun.argv.slice(2);
@@ -242,6 +239,24 @@ for (const path of [...pkgPaths].sort()) {
 
 const overrides: Record<string, string> = { ...(rootPkg.overrides ?? {}), ...(rootPkg.resolutions ?? {}) };
 
+// ─── журнал отложенных решений ────────────────────────────────────────────────
+
+type Decision = {
+  package: string;
+  declinedVersion: string;
+  installedAtDecision?: string;
+  reason: string;
+  decidedAt: string;
+  revisit: { whenBlockerAllows?: string[]; whenMajorAbove?: number; after?: string };
+};
+
+const journalPath = opt('decisions') ?? `${root}/.claude/deps-update.json`;
+const journalFile = Bun.file(journalPath);
+const decisions = new Map<string, Decision>();
+if (await journalFile.exists()) {
+  for (const d of (await journalFile.json())?.deferred ?? []) decisions.set(d.package, d);
+}
+
 // ─── registry ─────────────────────────────────────────────────────────────────
 
 const external = [...deps.keys()].filter((name) => {
@@ -321,11 +336,38 @@ async function installedTree(): Promise<Map<string, string[]>> {
 
 /** Диапазоны родителей из `bun why <pkg> --top`. */
 async function parentRanges(name: string): Promise<string[]> {
+  return [...new Set((await parentRequirements(name)).map((r) => r.range))];
+}
+
+/**
+ * Требования родителей с пометкой, чьи они.
+ *
+ * `bun why` печатает и наши воркспейсы (`backend@workspace (requires ^5.11.1)`) — для вопроса
+ * «отпустил ли блокер» они не считаются: это ровно тот диапазон, который мы и собираемся менять.
+ */
+async function parentRequirements(name: string): Promise<{ owner: string; range: string; fromWorkspace: boolean }[]> {
   const proc = Bun.spawn(['bun', 'why', name, '--top'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
   const out = stripAnsi(await new Response(proc.stdout).text());
   await proc.exited;
-  return [...new Set([...out.matchAll(/\(requires ([^)]+)\)/g)].map((m) => m[1]!.trim()))];
+
+  const seen = new Set<string>();
+  const result: { owner: string; range: string; fromWorkspace: boolean }[] = [];
+  for (const raw of out.split('\n')) {
+    const line = raw.replace(/^[\s│├└─]+/, '').trim();
+    const m = /^(?:optional )?(?:peer )?(\S+) \(requires ([^)]+)\)/.exec(line);
+    if (!m) continue;
+    const [owner, range] = [m[1]!, m[2]!.trim()];
+    const key = `${owner}|${range}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ owner, range, fromWorkspace: owner.endsWith('@workspace') });
+  }
+  return result;
 }
+
+/** Диапазон целиком разобран (каждая альтернатива — ^/~/точная/любая), значит по нему можно судить. */
+const rangeUnderstood = (range: string) =>
+  range.split('||').every((alt) => ['caret', 'tilde', 'exact', 'any'].includes(parseSpec(alt).kind));
 
 const installed = useWhy ? await installedTree() : new Map<string, string[]>();
 const copiesOf = (name: string) => installed.get(name) ?? [];
@@ -435,7 +477,63 @@ type Row = {
   inOverrides: string | null;
   note: string | null;
   peerSpecs: string[];
+  deferred: Decision | null;
+  /** Почему пора вернуться к отложенному вопросу; null — решение ещё в силе. */
+  revisit: string | null;
+  /** Внешние родители, которые всё ещё держат пакет на месте. */
+  heldBy: string[];
 };
+
+/**
+ * Отложенное решение живо, пока держится причина отказа. Вернуться к вопросу нужно, когда
+ * блокер отпустил пакет, вышел следующий мажор, истёк срок или проект уже ушёл вперёд сам.
+ */
+async function deferredStatus(
+  decision: Decision,
+  row: Omit<Row, 'deferred' | 'revisit' | 'heldBy'>,
+): Promise<{ revisit: string | null; heldBy: string[] }> {
+  const declined = parseVersion(decision.declinedVersion);
+  const latest = row.latest ? parseVersion(row.latest) : null;
+  const floor = row.floor ? parseVersion(row.floor) : null;
+  const held: string[] = [];
+
+  if (declined && floor && compare(floor, declined) >= 0) {
+    return {
+      revisit: `проект уже на ${row.floor} — решение устарело, убрать из журнала (\`decisions.ts resume ${row.name}\`)`,
+      heldBy: held,
+    };
+  }
+  if (decision.revisit.after && decision.revisit.after <= new Date().toISOString().slice(0, 10)) {
+    return { revisit: `истёк срок отсрочки (${decision.revisit.after})`, heldBy: held };
+  }
+  // Мажор отклонённой версии — нижняя граница: журнал с меньшим значением иначе срабатывал бы сразу.
+  const majorAbove = Math.max(decision.revisit.whenMajorAbove ?? -Infinity, declined?.major ?? -Infinity);
+  if (Number.isFinite(majorAbove) && latest && latest.major > majorAbove) {
+    return {
+      revisit: `вышел мажор ${latest.major}.x, отклоняли ${decision.declinedVersion} — это уже другое обновление`,
+      heldBy: held,
+    };
+  }
+  const named = decision.revisit.whenBlockerAllows ?? [];
+  if (named.length && latest && useWhy && row.copies.length > 0) {
+    const external = (await parentRequirements(row.name)).filter((r) => !r.fromWorkspace);
+    const blocking = external.filter((r) => rangeUnderstood(r.range) && !rangeAllows(r.range, latest));
+    held.push(...blocking.map((r) => `${r.owner} requires ${r.range}`));
+
+    // Судим только по блокерам, которые названы в решении: у листового пакета внешних родителей
+    // нет вовсе, и «никто не ограничивает» срабатывало бы каждый прогон.
+    const ownerName = (owner: string) => owner.replace(/@[^@]+$/, '');
+    const stillBlocking = blocking.filter((r) => named.includes(ownerName(r.owner)));
+    if (stillBlocking.length === 0) {
+      const gone = named.filter((n) => !external.some((r) => ownerName(r.owner) === n));
+      const reason = gone.length === named.length
+        ? `названный блокер (${named.join(', ')}) больше не тянет этот пакет`
+        : `блокер отпустил: ${named.join(', ')} больше не ограничивает ${row.latest}`;
+      return { revisit: reason, heldBy: held };
+    }
+  }
+  return { revisit: null, heldBy: held };
+}
 
 const rows: Row[] = [];
 const isAlignable = (field: string) => (ALIGNABLE_FIELDS as readonly string[]).includes(field);
@@ -467,7 +565,7 @@ for (const name of external) {
   const inRangeMax = info && widest ? maxSatisfying(info.versions, widest) : null;
   const installedMax = maxInstalled(name);
 
-  rows.push({
+  const base = {
     name,
     specs,
     mismatch: specs.length > 1,
@@ -477,14 +575,18 @@ for (const name of external) {
     atLatest: !!(installedMax && info?.latest && compare(installedMax, info.latest) >= 0),
     inRangeMax: inRangeMax ? fmt(inRangeMax) : null,
     latest: info?.latestRaw ?? null,
-    risk: floor && info?.latest ? riskClass(floor, info.latest) : 'unknown',
+    risk: floor && info?.latest ? riskClass(floor, info.latest) : ('unknown' as const),
     deprecated: info?.deprecatedLatest ?? null,
     workspaces: [...new Set(refs.map((r) => r.workspace))],
     family: family(name),
     inOverrides: overrides[name] ?? null,
     note: info?.error ? `registry: ${info.error}` : parsedSpecs.some((s) => s.kind === 'complex') ? 'сложный диапазон — проверить вручную' : null,
     peerSpecs: [...new Set(all.filter((r) => !isAlignable(r.field)).map((r) => `${r.raw} (${r.workspace})`))],
-  });
+  };
+
+  const decision = decisions.get(name) ?? null;
+  const status = decision ? await deferredStatus(decision, base) : { revisit: null, heldBy: [] };
+  rows.push({ ...base, deferred: decision, ...status });
 }
 
 rows.sort((a, b) => a.name.localeCompare(b.name));
@@ -553,9 +655,18 @@ if (transitiveDupes > 0) {
 }
 line();
 
-const candidates = rows
+const updatable = rows
   .filter((r) => r.risk !== 'up-to-date' && r.risk !== 'unknown')
   .sort((a, b) => (RISK_ORDER[a.risk]! - RISK_ORDER[b.risk]!) || a.name.localeCompare(b.name));
+
+// Отложенные вопросы не показываем как кандидатов — иначе скилл спросит то же самое в каждый прогон.
+const candidates = updatable.filter((r) => !r.deferred);
+// Разбираем ВСЕ решения, а не только те, что ещё числятся кандидатами: запись про пакет, который
+// тем временем обновился сам, иначе тихо жила бы в журнале вечно.
+const deferredRows = rows.filter((r) => r.deferred);
+const revisit = deferredRows.filter((r) => r.revisit);
+const asleep = deferredRows.filter((r) => !r.revisit);
+const orphaned = [...decisions.keys()].filter((name) => !rows.some((r) => r.name === name));
 
 line(`## 3. Кандидаты на обновление (${candidates.length})`);
 line();
@@ -577,6 +688,51 @@ if (candidates.length === 0) {
   line('*(latest уже стоит)* — обновлять нечего, правка диапазона лишь приводит запись в соответствие факту.');
   line('⚠ — в дереве несколько копий пакета: разные ветки тянут разные версии.');
   line('Жирный «макс. в диапазоне» — подтянется само при пересборке lockfile, даже без правки package.json.');
+}
+line();
+if (decisions.size) {
+  line(`Отложенных решений в журнале: ${decisions.size} (\`${journalPath}\`) — см. разделы 3a и 3b.`);
+  line();
+}
+
+line(`## 3a. Пора вернуться к отложенному (${revisit.length + orphaned.length})`);
+line();
+if (orphaned.length) {
+  line(`Пакета больше нет в зависимостях, запись мертва: ${orphaned.join(', ')} — почистить \`decisions.ts prune\`.`);
+  line();
+}
+if (revisit.length === 0) {
+  line('Нечего поднимать: у отложенных решений причина отказа не изменилась.');
+} else {
+  line('Причина прежнего отказа изменилась — эти вопросы стоит задать снова:');
+  line();
+  for (const r of revisit) {
+    line(`- **${r.name}**: отклоняли ${r.deferred!.declinedVersion} (${r.deferred!.decidedAt}, ${r.deferred!.reason})`);
+    line(`    - сейчас latest ${r.latest ?? '—'}, объявлено ${r.specs.map((s) => `\`${s}\``).join(', ')}`);
+    line(`    - **${r.revisit}**`);
+  }
+}
+line();
+
+line(`## 3b. Отложено — не спрашивать (${asleep.length})`);
+line();
+if (asleep.length === 0) {
+  line('Пусто.');
+} else {
+  line('Решение в силе: причина отказа держится. Поднимать вопрос заново не нужно.');
+  line();
+  for (const r of asleep) {
+    const when = [
+      r.deferred!.revisit.whenBlockerAllows?.length ? `отпустит ${r.deferred!.revisit.whenBlockerAllows.join(', ')}` : null,
+      r.deferred!.revisit.whenMajorAbove !== undefined ? `выйдет мажор выше ${r.deferred!.revisit.whenMajorAbove}` : null,
+      r.deferred!.revisit.after ? `наступит ${r.deferred!.revisit.after}` : null,
+    ].filter(Boolean);
+    line(
+      `- **${r.name}** ≠> ${r.deferred!.declinedVersion} (${r.deferred!.decidedAt}): ${r.deferred!.reason}` +
+        ` — вернуться, когда ${when.length ? when.join(' / ') : 'решит человек (`decisions.ts resume`)'}`,
+    );
+    if (r.heldBy.length) line(`    - держит: ${r.heldBy.join('; ')}`);
+  }
 }
 line();
 

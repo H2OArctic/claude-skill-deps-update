@@ -43,6 +43,7 @@ bun --version
 
 ```bash
 bun ~/.claude/skills/deps-update/scripts/deps-scan.ts            # + --json, --no-net, --no-why
+bun ~/.claude/skills/deps-update/scripts/decisions.ts list       # what was already deferred, and why
 bun outdated                                                     # root package.json
 bun outdated --filter='*'                                        # every workspace
 bun audit --json                                                 # vulnerabilities from the lockfile
@@ -77,6 +78,37 @@ copy is how an override gets called load-bearing when the old copy it was suppos
 
 Sort candidates into four groups and **show them to the user before touching any file**.
 
+### Already-answered questions stay answered
+
+A "not now" is a decision, not a mood. `deps-scan.ts` keeps it in `.claude/deps-update.json` and splits
+the deferred set for you:
+
+- **section 3b — do not ask.** The reason for the refusal still holds. These packages are not candidates,
+  not questions, and not part of the plan. Mention them as one line ("N deferred, unchanged") and move on.
+  Re-asking here is the failure mode this journal exists to prevent.
+- **section 3a — ask again, and say what changed.** The blocker released the package, a newer major landed,
+  the deferral expired, or the project has moved past the declined version on its own. Lead with the change
+  ("`react-dom` no longer pins it to 18.x"), not with the original question.
+
+When the user declines an update — now or after a section 3a discussion — record it, with the condition
+that should bring it back:
+
+```bash
+bun ~/.claude/skills/deps-update/scripts/decisions.ts defer <pkg> \
+  --declined <version> --reason "<why, in the user's words>" \
+  [--blocked-by <pkg,pkg>] [--after YYYY-MM-DD] [--major-above N]
+```
+
+- `--blocked-by` — the *external* parents that hold it (from `bun why`); the skill re-asks once they stop.
+  Name real packages: a made-up blocker resolves to "no longer holds it" on the next run.
+- `--after` — for "let's look again next quarter". Without any condition the question never returns
+  until someone runs `decisions.ts resume <pkg>`, so always leave at least one way back.
+- A declined major implies `--major-above <its major>`: the next major is a different decision and gets asked.
+- Deciding to go ahead with something previously deferred → `decisions.ts resume <pkg>` first, so the
+  journal does not contradict the tree.
+- The journal belongs to the project and is meant to be committed — it is the team's answer, not a cache.
+  Do not commit it yourself, though (see Never).
+
 ### A. Update right away
 
 - `patch` and `minor` when major ≥ 1, no peer conflicts, not part of a pinned family.
@@ -105,6 +137,10 @@ and how much work it is.
 A direct dependency cannot move past what a parent's `peerDependencies` allow: if a framework requires
 `^2.4.0` of a library, that library's `3.x` is unreachable until the framework's own major lands.
 Show the `bun why` output as evidence and do not try to work around it.
+
+Record these too — `defer <pkg> --declined <latest> --blocked-by <the parent>` — otherwise the same
+impossible update is re-litigated on every run. This is not a user decision to wait for: the tree already
+made it, so write it down and report it as recorded.
 
 ### D. Overrides / resolutions — noted here, decided in phase 5
 
@@ -247,6 +283,10 @@ then the build/compile check if there is one, then tests.
 ## Untouched
 <package — reason: peer block (bun why), 0.x major, exact pin, deprecated>
 
+## Deferred
+<recorded this run: package ≠> version, and what will bring the question back>
+<still deferred, not re-asked: N packages — one line, no details>
+
 ## Checks
 <typecheck / build / tests — result of each>
 
@@ -260,6 +300,8 @@ then the build/compile check if there is one, then tests.
 - Bump a `0.x` minor, a major, or a pinned family without explicit consent.
 - Judge, edit, or remove an override before the versions are updated and the lockfile is rebuilt — the
   answer belongs to the final tree, not the one you started with.
+- Re-ask a question the journal already answered while its condition still holds (section 3b). Equally:
+  never let a refusal go unrecorded — an unwritten "not now" comes back as the same question next week.
 - Remove an override without running `bun audit` and `bun why` afterwards.
 - Keep an override because a verdict said so. Verdicts rank ranges; only removing it and reinstalling
   shows what it does.
