@@ -7,8 +7,8 @@ description: Update libraries in a Bun project or monorepo with control over ove
 
 Runtime and package manager: **Bun only**. Never `npm`, `npx`, `yarn`, `pnpm`, or `node`.
 
-This skill does not chase `latest`. It splits updates by risk, manages `overrides` as a separate concern,
-and ends with a rebuilt lockfile plus typecheck and tests.
+This skill does not chase `latest`. It splits updates by risk, rebuilds the lockfile, then settles
+`overrides` on that final tree, and ends with typecheck and tests.
 
 Talk to the user in the language they use.
 
@@ -16,9 +16,9 @@ Talk to the user in the language they use.
 
 **Nothing is written to disk before the plan is approved (phase 2).** Phases 0–1 are read-only.
 
-One exception, and only with the user's consent: the overrides experiment in phase 2D temporarily edits
-the root `package.json` and reinstalls. Keep the original `overrides` block verbatim and restore it the
-moment the experiment ends — the plan is written from its result, not from it being left in place.
+The overrides experiment in phase 5 temporarily strips the root `overrides` block and reinstalls. Keep the
+original block verbatim: everything load-bearing goes back before the phase ends, so the stripped state is
+a measurement, never a result.
 
 ## Phase 0. Preflight
 
@@ -33,7 +33,7 @@ bun --version
   need different handling. Show the user what you found, then ask whether to continue. A clean tree means
   rollback is one command (`git checkout -- .`), so no backups are needed.
 - Working on top of someone else's uncommitted work is allowed, but from that moment you must be able to
-  say which changes are yours — phase 5 failures will otherwise get blamed on the update.
+  say which changes are yours — phase 6 failures will otherwise get blamed on the update.
 - Read the root `package.json`: which scripts exist (typecheck, tests, lockfile `clean`, dead-code checks),
   whether there are `workspaces`, `overrides`/`resolutions`. Use the project's own script names later —
   do not assume them.
@@ -49,7 +49,8 @@ bun audit --json                                                 # vulnerabiliti
 ```
 
 `deps-scan.ts` reports: version mismatches across workspaces, duplicate copies in the tree, a risk class
-per update, exact pins, package families, verdicts on `overrides`, and deprecated packages.
+per update, exact pins, package families, verdicts on `overrides` (hypotheses only — the override work
+happens in phase 5, on the rebuilt tree), and deprecated packages.
 `bun outdated` is the independent cross-check (`Update` = what the current range allows, `Latest` = absolute).
 Never paper over disagreements between the script and `bun outdated` — show them.
 
@@ -105,36 +106,14 @@ A direct dependency cannot move past what a parent's `peerDependencies` allow: i
 `^2.4.0` of a library, that library's `3.x` is unreachable until the framework's own major lands.
 Show the `bun why` output as evidence and do not try to work around it.
 
-### D. Overrides / resolutions
+### D. Overrides / resolutions — noted here, decided in phase 5
 
-**Decide this by experiment, not by reading ranges.** An override's declared range says what it asks for;
-only the tree says what it did. Bun does not rewrite every branch — an override can sit in `package.json`
-for a year while the old copy it was meant to replace is still installed under some parent.
+**Do not touch `overrides` yet, and do not judge them on the current tree.** Whether an override still
+earns its place depends on the versions around it, and those are about to change: a bumped parent may now
+require the fixed version by itself, and a rebuilt lockfile resolves branches differently. Any verdict
+reached before phase 4 describes a tree that will not exist by the time the work is done.
 
-Run the whole set at once — one experiment answers the entire block:
-
-```bash
-# 1. baseline, with overrides in place
-bun audit                              # expect: clean
-bun pm ls --all                        # keep this output
-
-# 2. strip ALL overrides from the root package.json, then
-bun install
-bun audit                              # what surfaced is what the overrides were actually holding
-bun pm ls --all                        # what changed version, what split into two copies
-```
-
-Read the result:
-
-- **A package shows up in `bun audit`** → that override is load-bearing. Put it back.
-- **A package collapsed several copies into one** (two versions in the tree became one) → load-bearing too,
-  even if `audit` is quiet: it is de-duplicating the tree.
-- **Nothing changed — same version, same number of copies, clean audit** → dead weight. Remove it.
-
-Then restore only the load-bearing ones and reinstall. Report the experiment's numbers (`N vulnerabilities
-without them`), not your reasoning about ranges.
-
-Verdicts from `deps-scan.ts` are **hypotheses to prioritise the experiment**, never the conclusion:
+For the plan, list them with their scan verdicts as **hypotheses** and say they are settled at the end:
 
 - `REDUNDANT_NOW` — parents already require at least this much. Most likely removable.
 - `RAISES_FLOOR` — raises the minimum inside what parents allow. Looks like a security override.
@@ -144,12 +123,8 @@ Verdicts from `deps-scan.ts` are **hypotheses to prioritise the experiment**, ne
 - `NOT_APPLIED` — no installed copy satisfies the override at all: the lockfile drifted from `package.json`
   (run `bun install`), or Bun never applied it. Range-based verdicts mean nothing here.
 
-Two rules that hold regardless of the experiment:
-
-- **A new override is needed** when `bun audit` reports a vulnerability in a transitive dependency with no
-  direct owner. Use the minimum sufficient range (`^` of the fixed version), never "a bit higher just in case".
-- A package present both in `overrides` and in direct dependencies must be **edited in both places at once** —
-  otherwise the override silently caps the update, or raises the installed version past what `package.json` says.
+One exception to the "not yet": if `bun audit` in phase 1 reports a vulnerability that a version bump in
+group A or B closes on its own, say so — that is an argument about the update, not about the override.
 
 ## Phase 3. Edits
 
@@ -190,10 +165,56 @@ git diff --stat
 - Rebuilding the lock pulls the maximum allowed by each range, so versions can move further than the
   `package.json` edits (the "max in range" column of the scan). That is expected, but list every such move.
 
-## Phase 5. Verification
+Keep the post-rebuild `bun audit` and `bun pm ls --all` output — **this** is the baseline for phase 5,
+the first tree on which an override question can be answered honestly.
 
-Run the project's own checks, in order, stopping at the first failure: typecheck first, then the build/compile
-check if there is one, then tests.
+## Phase 5. Overrides / resolutions
+
+Now, and not before: the versions are settled and the lockfile is rebuilt, so the tree finally is the one
+the project will ship with. **Decide by experiment, not by reading ranges.** An override's declared range
+says what it asks for; only the tree says what it did. Bun does not rewrite every branch — an override can
+sit in `package.json` for a year while the old copy it was meant to replace is still installed under some
+parent. And after an update, some of them are held up by nothing at all: the parent that needed forcing
+now requires the fixed version on its own.
+
+Run the whole set at once — one experiment answers the entire block:
+
+```bash
+# 1. strip ALL overrides from the root package.json, then
+bun install
+bun audit                              # what surfaced is what the overrides were actually holding
+bun pm ls --all                        # what changed version, what split into two copies
+```
+
+Compare against the phase 4 baseline and read the result per package:
+
+- **Shows up in `bun audit`** → load-bearing. Put it back, but re-derive the range: after the update the
+  minimum sufficient version may be lower than what the old override demanded.
+- **Several copies collapsed into one** (two versions in the tree became one) → load-bearing too, even if
+  `audit` is quiet: it is de-duplicating the tree.
+- **Nothing changed — same version, same copy count, clean audit** → dead weight. Remove it.
+- **A vulnerability that is new since phase 1** → it came from the update, not from the override set. Add a
+  fresh override with the minimum sufficient range (`^` of the fixed version), never "a bit higher just in case".
+
+A package present both in `overrides` and in direct dependencies must be **edited in both places at once** —
+otherwise the override silently caps the update, or raises the installed version past what `package.json` says.
+
+Then write the final `overrides` block — only the load-bearing ones — and settle the lockfile again:
+
+```bash
+bun install
+bun audit                              # expect: clean
+```
+
+If the set changed, rebuild the lockfile once more (`bun run clean`, same confirmation as phase 4) so the
+committed lock is the one resolved from the final `overrides`, not a patched intermediate. Report the
+experiment's numbers (`N vulnerabilities without them`, copies before/after), not reasoning about ranges.
+
+## Phase 6. Verification
+
+Run the project's own checks on the final tree — after the overrides are settled, so a failure is not
+chased across two different dependency graphs. In order, stopping at the first failure: typecheck first,
+then the build/compile check if there is one, then tests.
 
 - **A command that exits 0 without doing anything is not a passing check.** A task runner reporting
   `0 successful, 0 total` / "no tasks were executed" means the script is missing in the workspaces, not that
@@ -205,8 +226,10 @@ check if there is one, then tests.
   state that it is unrelated to the dependency work, and do not "fix" someone's work in progress.
 - On failure: find the culprit (`git diff` + the error) and roll back **only that package**, keeping the rest.
   A breaking major from group B gets reverted whole and reported as "needs its own task".
+- A removed override is a suspect like any bumped version: if the failure involves a transitive package that
+  the experiment let split or fall back, restore that one override and re-run the check.
 
-## Phase 6. Report
+## Phase 7. Report
 
 ```
 ## Updated
@@ -235,6 +258,8 @@ check if there is one, then tests.
 
 - Turn an exact version into `^`, or "simplify" a pin.
 - Bump a `0.x` minor, a major, or a pinned family without explicit consent.
+- Judge, edit, or remove an override before the versions are updated and the lockfile is rebuilt — the
+  answer belongs to the final tree, not the one you started with.
 - Remove an override without running `bun audit` and `bun why` afterwards.
 - Keep an override because a verdict said so. Verdicts rank ranges; only removing it and reinstalling
   shows what it does.
