@@ -13,6 +13,13 @@ import { dirname, join, resolve } from 'node:path';
 const REPO_ROOT = resolve(import.meta.dir, '..');
 const SKILL_SRC = join(REPO_ROOT, 'skill');
 const SKILL_NAME = 'deps-update';
+/** Метка привязана к пути репозитория: две установки не должны глушить проверки друг друга. */
+const STAMP = join(
+  homedir(),
+  '.cache',
+  'claude-skill-deps-update',
+  `last-selfupdate-${Bun.hash(REPO_ROOT).toString(36)}`,
+);
 
 const args = Bun.argv.slice(2);
 const command = args[0] ?? 'help';
@@ -131,8 +138,6 @@ async function update(): Promise<number> {
  */
 async function selfupdate(): Promise<number> {
   const maxAge = Number(value('max-age') ?? 21600); // 6 часов
-  const stampDir = join(homedir(), '.cache', 'claude-skill-deps-update');
-  const stamp = join(stampDir, 'last-selfupdate');
   const say = (msg: string) => console.log(msg);
 
   if (!(await git('rev-parse', '--is-inside-work-tree')).ok) return 0;
@@ -140,7 +145,7 @@ async function selfupdate(): Promise<number> {
 
   if (!has('force') && Number.isFinite(maxAge)) {
     try {
-      const checkedAt = (await lstat(stamp)).mtimeMs;
+      const checkedAt = (await lstat(STAMP)).mtimeMs;
       if ((Date.now() - checkedAt) / 1000 < maxAge) return 0;
     } catch {
       // метки ещё нет — это первая проверка
@@ -148,8 +153,8 @@ async function selfupdate(): Promise<number> {
   }
 
   // Метку ставим до сети: недоступный remote не должен превращаться в проверку на каждый запуск.
-  await mkdir(stampDir, { recursive: true });
-  await Bun.write(stamp, '');
+  await mkdir(dirname(STAMP), { recursive: true });
+  await Bun.write(STAMP, '');
 
   if ((await git('status', '--porcelain')).out) {
     if (!has('quiet')) console.error('deps-update: есть незакоммиченные изменения — автообновление пропущено');
@@ -265,7 +270,7 @@ async function status(): Promise<number> {
   const hooked = (await settingsFile.exists()) && (await settingsFile.text()).includes('cli.ts selfupdate');
   let checkedAgo = '';
   try {
-    const ms = Date.now() - (await lstat(join(homedir(), '.cache', 'claude-skill-deps-update', 'last-selfupdate'))).mtimeMs;
+    const ms = Date.now() - (await lstat(STAMP)).mtimeMs;
     checkedAgo = `, последняя проверка ${Math.floor(ms / 3_600_000)} ч ${Math.floor((ms % 3_600_000) / 60_000)} мин назад`;
   } catch {
     checkedAgo = ', проверок ещё не было';
