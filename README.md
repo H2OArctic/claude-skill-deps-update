@@ -21,18 +21,35 @@ git clone git@github.com:H2OArctic/claude-skill-deps-update.git ~/Developer/clau
 cd ~/Developer/claude-skill-deps-update
 bun install
 bun bin/cli.ts install
+bun bin/cli.ts hook        # автообновление, см. ниже
 ```
 
-`install` кладёт симлинк `~/.claude/skills/deps-update` → `<репозиторий>/skill`, поэтому `git pull`
-обновляет скилл сразу, без переустановки. Нужна независимая копия — `bun bin/cli.ts install --copy`.
+`install` кладёт симлинк `~/.claude/skills/deps-update` → `<репозиторий>/skill`, поэтому свежий коммит
+становится скиллом сразу, без переустановки. Нужна независимая копия — `bun bin/cli.ts install --copy`.
 
 В Claude Code скилл вызывается как `/deps-update`.
 
 ## Обновление
 
+`hook` прописывает в `~/.claude/settings.json` хук `SessionStart`, который при старте сессии тихо
+делает `git fetch` + fast-forward — руками `git pull` дёргать не нужно:
+
+- проверка не чаще раза в 6 часов (метка `~/.cache/claude-skill-deps-update/last-selfupdate`),
+  так что обычный старт ничего не делает и ничего не стоит;
+- `async: true` — сессия не ждёт сеть;
+- молчит всегда, кроме факта обновления: одна строка `Скилл deps-update обновлён до X (a → b)`;
+- незакоммиченные изменения или невозможный fast-forward — обновление пропускается, разбирается человек;
+- выключить: `bun bin/cli.ts hook --remove`.
+
+Настройки читаются и пишутся целиком, прежняя версия остаётся рядом как `settings.json.bak`,
+права файла сохраняются.
+
+Вручную — когда угодно:
+
 ```bash
 cd ~/Developer/claude-skill-deps-update
-bun bin/cli.ts update      # git pull --ff-only + актуализация установки
+bun bin/cli.ts update           # git pull --ff-only + актуализация установки
+bun bin/cli.ts selfupdate --force   # то же, что делает хук, но игнорируя интервал
 ```
 
 ## Команды
@@ -41,7 +58,9 @@ bun bin/cli.ts update      # git pull --ff-only + актуализация ус�
 |---|---|
 | `bun bin/cli.ts install [--copy] [--force] [--skills-dir <dir>] [--target <dir>]` | Установка (симлинк или копия) |
 | `bun bin/cli.ts update` | `git pull --ff-only`, обновление копии, проверка симлинка |
-| `bun bin/cli.ts status` | Где установлен, какая ревизия, версия Bun |
+| `bun bin/cli.ts selfupdate [--max-age <sec>] [--force] [--quiet]` | Тихий fetch + fast-forward, для хука |
+| `bun bin/cli.ts hook [--remove]` | Включить/выключить автообновление через `SessionStart` |
+| `bun bin/cli.ts status` | Где установлен, какая ревизия, состояние автообновления, версия Bun |
 | `bun bin/cli.ts uninstall` | Снять установку (файлы репозитория не трогает) |
 | `bun bin/cli.ts scan [args...]` | Запустить анализатор в текущем проекте |
 

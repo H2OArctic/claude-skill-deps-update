@@ -1,6 +1,6 @@
 {
   "name": "claude-skill-deps-update",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Skill for Claude Code: safe dependency updates in Bun monorepos — risk-classified bumps, version alignment, overrides lifecycle, peer-conflict detection, lockfile rebuild",
   "type": "module",
   "license": "MIT",
@@ -10,6 +10,7 @@
   "scripts": {
     "skill:install": "bun bin/cli.ts install",
     "skill:update": "bun bin/cli.ts update",
+    "skill:hook": "bun bin/cli.ts hook",
     "skill:status": "bun bin/cli.ts status",
     "skill:uninstall": "bun bin/cli.ts uninstall",
     "scan": "bun bin/cli.ts scan"

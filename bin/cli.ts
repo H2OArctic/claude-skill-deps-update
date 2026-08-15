@@ -6,7 +6,7 @@
  * поэтому `git pull` сразу обновляет скилл. `--copy` кладёт независимую копию.
  */
 
-import { cp, lstat, mkdir, readlink, rm, symlink } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, readlink, rm, symlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -122,6 +122,122 @@ async function update(): Promise<number> {
   return 1;
 }
 
+/**
+ * Тихое самообновление для хука SessionStart: fetch + fast-forward, не чаще `--max-age` секунд.
+ *
+ * Молчит всегда, кроме факта обновления: хук печатает в контекст сессии, и шум там дороже пользы.
+ * Отказывается работать при незакоммиченных изменениях и при расхождении истории — тогда решает
+ * человек, а не хук.
+ */
+async function selfupdate(): Promise<number> {
+  const maxAge = Number(value('max-age') ?? 21600); // 6 часов
+  const stampDir = join(homedir(), '.cache', 'claude-skill-deps-update');
+  const stamp = join(stampDir, 'last-selfupdate');
+  const say = (msg: string) => console.log(msg);
+
+  if (!(await git('rev-parse', '--is-inside-work-tree')).ok) return 0;
+  if (!(await git('remote')).out) return 0;
+
+  if (!has('force') && Number.isFinite(maxAge)) {
+    try {
+      const checkedAt = (await lstat(stamp)).mtimeMs;
+      if ((Date.now() - checkedAt) / 1000 < maxAge) return 0;
+    } catch {
+      // метки ещё нет — это первая проверка
+    }
+  }
+
+  // Метку ставим до сети: недоступный remote не должен превращаться в проверку на каждый запуск.
+  await mkdir(stampDir, { recursive: true });
+  await Bun.write(stamp, '');
+
+  if ((await git('status', '--porcelain')).out) {
+    if (!has('quiet')) console.error('deps-update: есть незакоммиченные изменения — автообновление пропущено');
+    return 0;
+  }
+
+  const branch = (await git('rev-parse', '--abbrev-ref', 'HEAD')).out;
+  if (!(await git('fetch', '--quiet', 'origin', branch)).ok) return 0;
+
+  const before = (await git('rev-parse', '--short', 'HEAD')).out;
+  const remote = (await git('rev-parse', '--short', `origin/${branch}`)).out;
+  if (!remote || before === remote) return 0;
+
+  const merge = await git('merge', '--ff-only', `origin/${branch}`);
+  if (!merge.ok) {
+    if (!has('quiet')) console.error(`deps-update: fast-forward невозможен, обнови вручную:\n${merge.out}`);
+    return 0;
+  }
+
+  const after = (await git('rev-parse', '--short', 'HEAD')).out;
+  const version = (await Bun.file(join(REPO_ROOT, 'package.json')).json()).version;
+  if ((await statKind(target)) === 'copy-ours') {
+    await rm(target, { recursive: true, force: true });
+    await cp(SKILL_SRC, target, { recursive: true });
+  }
+  say(`Скилл deps-update обновлён до ${version} (${before} → ${after}).`);
+  return 0;
+}
+
+/**
+ * Прописывает (или убирает) хук SessionStart в ~/.claude/settings.json.
+ *
+ * Хук вызывает `selfupdate`, поэтому обновление скилла перестаёт зависеть от того, вспомнил ли
+ * кто-то про `git pull`. Настройки читаются и пишутся целиком, рядом остаётся `.bak`.
+ */
+async function hook(): Promise<number> {
+  const settingsPath = value('settings') ?? join(homedir(), '.claude', 'settings.json');
+  const command = `bun ${join(REPO_ROOT, 'bin', 'cli.ts')} selfupdate --quiet`;
+  const file = Bun.file(settingsPath);
+  const settings = (await file.exists()) ? await file.json() : {};
+
+  settings.hooks ??= {};
+  const entries: any[] = (settings.hooks.SessionStart ??= []);
+  const isOurs = (entry: any) =>
+    (entry?.hooks ?? []).some((h: any) => typeof h?.command === 'string' && h.command.includes('cli.ts selfupdate'));
+
+  if (has('remove')) {
+    const kept = entries.filter((e) => !isOurs(e));
+    if (kept.length === entries.length) {
+      console.log('Хук не найден — нечего убирать.');
+      return 0;
+    }
+    settings.hooks.SessionStart = kept;
+    if (kept.length === 0) delete settings.hooks.SessionStart;
+    if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  } else {
+    const existing = entries.find(isOurs);
+    // Без matcher — SessionStart его не использует. async: старт сессии не должен ждать сеть.
+    const entry = { hooks: [{ type: 'command', command, timeout: 15, async: true }] };
+    if (existing) {
+      if (JSON.stringify(existing) === JSON.stringify(entry)) {
+        console.log(`Хук уже прописан в ${settingsPath}`);
+        return 0;
+      }
+      Object.assign(existing, entry); // путь к репозиторию или таймаут изменились
+    } else {
+      entries.push(entry);
+    }
+  }
+
+  // Права на settings.json обычно сужены (600) — Bun.write создаёт файл заново, режим надо вернуть.
+  let mode: number | null = null;
+  if (await file.exists()) {
+    mode = (await lstat(settingsPath)).mode & 0o777;
+    await Bun.write(`${settingsPath}.bak`, await file.text());
+    await chmod(`${settingsPath}.bak`, mode);
+  }
+  await Bun.write(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  if (mode !== null) await chmod(settingsPath, mode);
+  console.log(
+    has('remove')
+      ? `Хук убран из ${settingsPath} (копия прежних настроек — ${settingsPath}.bak)`
+      : `Хук SessionStart прописан в ${settingsPath} (копия прежних настроек — ${settingsPath}.bak).\n` +
+          'Скилл будет обновляться сам, не чаще раза в 6 часов.',
+  );
+  return 0;
+}
+
 async function status(): Promise<number> {
   const kind = await statKind(target);
   const head = await git('rev-parse', '--short', 'HEAD');
@@ -144,6 +260,17 @@ async function status(): Promise<number> {
       }[kind]
     }`,
   );
+  const settingsPath = value('settings') ?? join(homedir(), '.claude', 'settings.json');
+  const settingsFile = Bun.file(settingsPath);
+  const hooked = (await settingsFile.exists()) && (await settingsFile.text()).includes('cli.ts selfupdate');
+  let checkedAgo = '';
+  try {
+    const ms = Date.now() - (await lstat(join(homedir(), '.cache', 'claude-skill-deps-update', 'last-selfupdate'))).mtimeMs;
+    checkedAgo = `, последняя проверка ${Math.floor(ms / 3_600_000)} ч ${Math.floor((ms % 3_600_000) / 60_000)} мин назад`;
+  } catch {
+    checkedAgo = ', проверок ещё не было';
+  }
+  console.log(`автообновление: ${hooked ? 'хук SessionStart прописан' : 'выключено (`hook` — включить)'}${checkedAgo}`);
   console.log(`bun:        ${Bun.version}`);
   return kind === 'absent' ? 1 : 0;
 }
@@ -177,6 +304,9 @@ function help(): number {
 
   bun bin/cli.ts install [--copy] [--force] [--skills-dir <dir>] [--target <dir>]
   bun bin/cli.ts update            git pull + актуализация установки
+  bun bin/cli.ts selfupdate        тихий fetch + fast-forward для хука SessionStart
+                                   [--max-age <sec>, по умолчанию 21600] [--force] [--quiet]
+  bun bin/cli.ts hook [--remove]   прописать/убрать хук SessionStart в ~/.claude/settings.json
   bun bin/cli.ts status            где установлен, какая ревизия
   bun bin/cli.ts uninstall         снять установку (файлы пакета остаются)
   bun bin/cli.ts scan [args...]    запустить анализатор в текущем проекте
@@ -189,6 +319,8 @@ function help(): number {
 const handlers: Record<string, () => Promise<number> | number> = {
   install,
   update,
+  selfupdate,
+  hook,
   status,
   uninstall,
   scan,
