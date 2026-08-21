@@ -13,6 +13,9 @@ import { dirname, join, resolve } from 'node:path';
 const REPO_ROOT = resolve(import.meta.dir, '..');
 const SKILL_SRC = join(REPO_ROOT, 'skill');
 const SKILL_NAME = 'deps-update';
+/** Скилл опирается на Bun.JSONC, Bun.semver, `bun dedupe`, `bun audit fix`, `bun pm diff`. */
+const MIN_BUN = '1.4.0';
+const bunOutdated = Bun.semver.order(Bun.version.replace(/-.*$/, ''), MIN_BUN) < 0;
 /** Метка привязана к пути репозитория: две установки не должны глушить проверки друг друга. */
 const STAMP = join(
   homedir(),
@@ -66,6 +69,11 @@ const pkg = await Bun.file(join(REPO_ROOT, 'package.json')).json();
 async function install(): Promise<number> {
   const kind = await statKind(target);
   const copyMode = has('copy');
+
+  if (bunOutdated) {
+    console.error(`Нужен Bun >= ${MIN_BUN} (сейчас ${Bun.version}): обнови через \`bun upgrade\` и повтори.`);
+    return 1;
+  }
 
   if (kind === 'symlink-ours' && !copyMode) {
     console.log(`Уже установлен: ${target} → ${SKILL_SRC}`);
@@ -276,8 +284,8 @@ async function status(): Promise<number> {
     checkedAgo = ', проверок ещё не было';
   }
   console.log(`автообновление: ${hooked ? 'хук SessionStart прописан' : 'выключено (`hook` — включить)'}${checkedAgo}`);
-  console.log(`bun:        ${Bun.version}`);
-  return kind === 'absent' ? 1 : 0;
+  console.log(`bun:        ${Bun.version}${bunOutdated ? ` — НУЖЕН >= ${MIN_BUN}, обнови через \`bun upgrade\`` : ''}`);
+  return kind === 'absent' || bunOutdated ? 1 : 0;
 }
 
 async function uninstall(): Promise<number> {
@@ -317,7 +325,9 @@ function help(): number {
   bun bin/cli.ts scan [args...]    запустить анализатор в текущем проекте
 
 Анализатор напрямую (из корня проверяемого проекта):
-  bun ${join(SKILL_SRC, 'scripts', 'deps-scan.ts')} [--json] [--no-net] [--no-why] [--cwd <path>]`);
+  bun ${join(SKILL_SRC, 'scripts', 'deps-scan.ts')} [--json] [--no-net] [--no-tree] [--min-age <дней>] [--cwd <path>]
+
+Требуется Bun >= ${MIN_BUN} (сейчас ${Bun.version}).`);
   return 0;
 }
 

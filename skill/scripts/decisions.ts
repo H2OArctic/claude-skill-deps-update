@@ -14,6 +14,8 @@
  *   bun decisions.ts prune                 убрать записи о пакетах, которых больше нет в package.json
  */
 
+import { parseVersion } from './lib/semver.ts';
+
 type Revisit = {
   /** Вернуться, когда эти родители перестанут ограничивать пакет. */
   whenBlockerAllows?: string[];
@@ -97,13 +99,24 @@ async function defer(): Promise<number> {
     return 1;
   }
 
-  const major = Number(declined.split('.')[0]);
+  // Точная версия, а не диапазон: по её мажору deps-scan решает, что следующий — уже другой вопрос.
+  const parsed = parseVersion(declined);
+  if (!parsed) {
+    console.error(`--declined ждёт точную версию (например 5.2.1), получено «${declined}».`);
+    return 1;
+  }
+
+  const explicitMajor = value('major-above');
   const revisit: Revisit = {
-    whenMajorAbove: value('major-above') !== undefined ? Number(value('major-above')) : (Number.isFinite(major) ? major : undefined),
+    whenMajorAbove: explicitMajor !== undefined ? Number(explicitMajor) : parsed.major,
   };
   const blockedBy = value('blocked-by');
   if (blockedBy) revisit.whenBlockerAllows = blockedBy.split(',').map((s) => s.trim()).filter(Boolean);
   if (value('after')) revisit.after = value('after');
+  if (Number.isNaN(revisit.whenMajorAbove)) {
+    console.error(`--major-above ждёт число, получено «${explicitMajor}».`);
+    return 1;
+  }
 
   const journal = await read();
   const entry: Decision = {
