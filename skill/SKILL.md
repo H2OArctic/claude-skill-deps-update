@@ -68,6 +68,11 @@ automatically) whenever the project has no policy of its own — see **Supply ch
 `bun outdated` is the independent cross-check (`Update` = what the current range allows, `Latest` = absolute).
 Never paper over disagreements between the script and `bun outdated` — show them.
 
+The same rule holds for the security section: if the scan says the audit did **not** run (`НЕ ПРОВЕРЕНО`,
+a `bun audit` failure line in the header), that is a failed check, not a clean tree. Re-run `bun audit`
+and `bun audit fix --dry-run --json` by hand, and report the manual numbers — with a breakdown by
+severity, because `bun audit` counts advisories while a per-package list counts packages.
+
 The two tools measure different things and disagree by design: the scan's range column is what
 `package.json` *declares*, `bun outdated`'s `Current` is what is *installed*. A dependency declared
 `^4.1.0` with `4.2.0` on disk is already up to date — editing the range there is bookkeeping,
@@ -455,3 +460,5 @@ then the build/compile check if there is one, then tests.
 - Wipe `node_modules` or the lockfile without confirmation.
 - Commit or push: committing happens only on a separate, explicit request.
 - Report success when tests did not run or failed.
+- Read a tool failure as a clean result — an audit that did not parse is zero information, not zero
+  vulnerabilities. When two tools disagree, the manual run wins and the disagreement goes into the report.

@@ -40,6 +40,15 @@ import {
 } from './lib/semver.ts';
 import { type LockTree, type Requirement, emptyLock, parseLock } from './lib/lockfile.ts';
 import { type OverrideRule, flattenOverrides, normalizeOverrides } from './lib/overrides.ts';
+import {
+  type AuditSummary,
+  type VulnPackage,
+  countSeverities,
+  extractJson,
+  formatSeverities,
+  parseAuditReport,
+  parseAuditSummary,
+} from './lib/audit.ts';
 
 // ─── аргументы ────────────────────────────────────────────────────────────────
 
@@ -338,22 +347,31 @@ const ageDays = (name: string, version: string | null): number | null => {
 
 // ─── read-only команды Bun ────────────────────────────────────────────────────
 
-async function run(cmd: string[]): Promise<{ ok: boolean; out: string }> {
+type RunResult = { ok: boolean; code: number; stdout: string; stderr: string };
+
+const noAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+/**
+ * Потоки НЕ склеиваются: `--json` пишет отчёт в stdout, а `warn:`/`error:` уходят в stderr,
+ * и склейка превращала валидный JSON в мусор («не вернул JSON» на живом аудите).
+ * stderr нужен отдельно — как текст причины, когда разбор всё-таки не удался.
+ */
+async function run(cmd: string[]): Promise<RunResult> {
   const proc = Bun.spawn(cmd, { cwd: root, stdout: 'pipe', stderr: 'pipe' });
-  const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   const code = await proc.exited;
-  return { ok: code === 0, out: (out + err).replace(/\x1b\[[0-9;]*m/g, '') };
+  return { ok: code === 0, code, stdout: noAnsi(stdout), stderr: noAnsi(stderr) };
 }
 
-/** JSON в выводе Bun идёт после строки версии — берём с первой скобки. */
-function parseJsonTail(out: string): any | null {
-  const start = out.indexOf('{');
-  if (start === -1) return null;
-  try {
-    return JSON.parse(out.slice(start));
-  } catch {
-    return null;
-  }
+/** Почему команда не дала разбираемого ответа — с кодом выхода и первой содержательной строкой вывода. */
+function failureNote(cmd: string, res: RunResult): string {
+  const reason =
+    res.stderr
+      .split('\n')
+      .map((l) => l.trim())
+      .find(Boolean) ??
+    (res.stdout.trim() ? 'вывод не разобран как JSON' : 'пустой вывод');
+  return `\`${cmd}\`: код ${res.code}, ${reason}`;
 }
 
 type AuditFix = {
@@ -366,9 +384,21 @@ type AuditFix = {
 };
 
 type AuditPlan = {
-  ran: boolean;
+  /** Команды вообще запускались: без сети или без lockfile проверять нечего, и это не сбой. */
+  attempted: boolean;
+  /** `bun audit --json` разобран. false = проверка НЕ пройдена; это не то же самое, что «чисто». */
+  scanned: boolean;
+  /** `bun audit fix --dry-run --json` разобран. */
+  planned: boolean;
+  /** Почему не разобрался аудит. */
   note: string | null;
-  vulnerable: { name: string; advisories: { title: string; severity: string; url: string; range: string }[] }[];
+  /** Почему не разобрался план фикса. */
+  planNote: string | null;
+  vulnerable: VulnPackage[];
+  /** Advisory, а не пакеты: `bun audit` в своей сводке считает именно их. */
+  summary: AuditSummary;
+  /** Сводка из текстового `bun audit`, когда JSON не разобрался, — чтобы отчёт не показывал ноль. */
+  textSummary: AuditSummary | null;
   fixed: number;
   remaining: number;
   fixes: AuditFix[];
@@ -381,38 +411,57 @@ type AuditPlan = {
  *
  * Второй вызов — единственный источник, который считает МИНИМАЛЬНО достаточную безопасную версию
  * с учётом диапазонов всех зависимых. Гадать про «подняли бы до latest» больше не нужно.
+ *
+ * Оба вызова независимы и разбираются порознь: сбой одного не должен обнулять данные другого
+ * и тем более не должен выглядеть как чистый аудит. Если JSON не разобрался — идём за текстовой
+ * сводкой `bun audit`, чтобы в отчёт попало реальное число уязвимостей, а не ноль по умолчанию.
  */
 async function auditPlan(): Promise<AuditPlan> {
-  const empty: AuditPlan = { ran: false, note: null, vulnerable: [], fixed: 0, remaining: 0, fixes: [], blocked: [], unfixable: [] };
-  if (!useNet) return { ...empty, note: '--no-net: bun audit не запускался' };
-  if (!hasTree) return { ...empty, note: 'нет bun.lock: bun audit нечего проверять' };
+  const empty: AuditPlan = {
+    attempted: false,
+    scanned: false,
+    planned: false,
+    note: null,
+    planNote: null,
+    vulnerable: [],
+    summary: { total: 0, bySeverity: {} },
+    textSummary: null,
+    fixed: 0,
+    remaining: 0,
+    fixes: [],
+    blocked: [],
+    unfixable: [],
+  };
+  if (!useNet) return { ...empty, note: '--no-net: bun audit не запускался', planNote: '--no-net: план фикса не строился' };
+  if (!hasTree) {
+    // Причина важна: «lockfile не читался из-за --no-tree» и «lockfile отсутствует» лечатся по-разному.
+    const why = useTree ? `дерево не читается (${lock.note})` : 'флаг --no-tree';
+    return { ...empty, note: `${why}: bun audit нечего проверять`, planNote: `${why}: план фикса не строился` };
+  }
 
+  // Последовательно: две команды Bun в одном проекте делят lockfile и кеш, параллелить их незачем.
   const report = await run(['bun', 'audit', '--json']);
-  const body = parseJsonTail(report.out) ?? {};
-  const vulnerable: AuditPlan['vulnerable'] = Object.entries<any>(body)
-    .filter(([, list]) => Array.isArray(list) && list.length)
-    .map(([name, list]) => ({
-      name,
-      advisories: list.map((a: any) => ({
-        title: a.title ?? '',
-        severity: a.severity ?? 'unknown',
-        url: a.url ?? '',
-        range: a.vulnerable_versions ?? '',
-      })),
-    }));
+  const fix = await run(['bun', 'audit', 'fix', '--dry-run', '--json']);
+  const vulnerable = parseAuditReport(extractJson(report.stdout));
+  const plan = extractJson(fix.stdout) as any;
 
-  const plan = parseJsonTail((await run(['bun', 'audit', 'fix', '--dry-run', '--json'])).out);
-  if (!plan) return { ...empty, ran: vulnerable.length > 0, vulnerable, note: 'bun audit fix --dry-run не вернул JSON' };
+  // Текстовый прогон — только как запасной источник: лишний запрос в registry без нужды не делаем.
+  const textSummary = vulnerable ? null : parseAuditSummary((await run(['bun', 'audit'])).stdout);
 
   return {
-    ran: true,
-    note: null,
-    vulnerable,
-    fixed: plan.fixed ?? 0,
-    remaining: plan.remaining ?? 0,
-    fixes: plan.fixes ?? [],
-    blocked: plan.blocked ?? [],
-    unfixable: plan.unfixable ?? [],
+    attempted: true,
+    scanned: vulnerable !== null,
+    planned: !!plan && typeof plan === 'object',
+    note: vulnerable ? null : failureNote('bun audit --json', report),
+    planNote: plan && typeof plan === 'object' ? null : failureNote('bun audit fix --dry-run --json', fix),
+    vulnerable: vulnerable ?? [],
+    summary: countSeverities(vulnerable ?? []),
+    textSummary,
+    fixed: plan?.fixed ?? 0,
+    remaining: plan?.remaining ?? 0,
+    fixes: plan?.fixes ?? [],
+    blocked: plan?.blocked ?? [],
+    unfixable: plan?.unfixable ?? [],
   };
 }
 
@@ -423,11 +472,12 @@ async function dedupePlan(): Promise<DedupePlan> {
   if (!hasTree) return { ran: false, note: 'нет bun.lock', removable: [] };
   const res = await run(['bun', 'dedupe', '--dry-run']);
   const removable: DedupePlan['removable'] = [];
-  for (const raw of res.out.split('\n')) {
+  for (const raw of res.stdout.split('\n')) {
     const m = /^\s*~\s+(\S+)\s+(\d[^\s]*)(?:\s+->\s+(\d[^\s]*))?\s*$/.exec(raw);
     if (m) removable.push({ name: m[1]!, from: m[2]!, to: m[3] ?? null });
   }
-  return { ran: true, note: res.ok ? null : 'bun dedupe --dry-run завершился с ошибкой', removable };
+  // Ошибка команды = список пуст не потому, что схлопывать нечего: об этом нужно сказать, а не молчать.
+  return { ran: res.ok, note: res.ok ? null : failureNote('bun dedupe --dry-run', res), removable };
 }
 
 const [audit, dedupe] = await Promise.all([auditPlan(), dedupePlan()]);
@@ -745,6 +795,15 @@ if (asJson) {
 
 const line = (s = '') => console.log(s);
 const days = (n: number) => (n < 1 ? `${Math.round(n * 24)} ч` : `${Math.round(n)} дн`);
+/** Счётные формы: 1 уязвимость, 2 уязвимости, 5 уязвимостей. */
+const plural = (n: number, one: string, few: string, many: string) => {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14)) return few;
+  return many;
+};
+const vulns = (n: number) => `${n} ${plural(n, 'уязвимость', 'уязвимости', 'уязвимостей')}`;
 
 line(`# deps-scan: ${rootPkg.name ?? root}`);
 line();
@@ -767,6 +826,11 @@ if (lock.trustedDependencies.length) {
   line(`- trustedDependencies: ${lock.trustedDependencies.join(', ')} — им разрешены install-скрипты`);
 }
 if (!useNet) line('- **--no-net**: latest не запрашивался, риск-классы и `bun audit` недоступны');
+// Сбой аудита виден сразу в шапке: раздел 6 читают не всегда, а «0 уязвимостей» из-за сбоя вводит в заблуждение.
+if (audit.attempted && !audit.scanned) {
+  const seen = audit.textSummary?.total ?? (audit.planned ? audit.fixed + audit.remaining : null);
+  line(`- 🛡 **\`bun audit\` не отработал** — ${audit.note}${seen ? `; другой источник видит ${vulns(seen)}` : ''} (раздел 6)`);
+}
 if (!hasTree) line(`- **дерево не читалось**: ${lock.note} — колонки «Установлено»/«Копии» и вердикты пустые`);
 if (minAgeDays !== null) {
   line(`- порог свежести: ${days(minAgeDays)}${opt('min-age') === undefined ? ' (из bunfig.toml)' : ''} — версии моложе помечены ⏳`);
@@ -840,6 +904,9 @@ if (dedupe.ran && dedupe.removable.length) {
 } else if (dedupe.ran) {
   line();
   line('`bun dedupe --dry-run`: схлопывать нечего.');
+} else if (dedupe.note) {
+  line();
+  line(`⚠️ \`bun dedupe --dry-run\` не отработал — дубли не проверены: ${dedupe.note}`);
 }
 line();
 
@@ -1004,18 +1071,61 @@ if (overrideReport.length === 0) {
 }
 line();
 
-line(`## 6. Уязвимости и план \`bun audit fix\` (${audit.vulnerable.length})`);
+const auditCount = !audit.attempted
+  ? 'не проверялось'
+  : !audit.scanned
+    ? 'НЕ ПРОВЕРЕНО'
+    : audit.summary.total === 0
+      ? 'чисто'
+      : `${audit.summary.total} advisory в ${audit.vulnerable.length} ${plural(audit.vulnerable.length, 'пакете', 'пакетах', 'пакетах')}`;
+line(`## 6. Уязвимости и план \`bun audit fix\` (${auditCount})`);
 line();
-if (!audit.ran) {
+if (!audit.attempted) {
   line(audit.note ?? 'не запускалось.');
+} else if (!audit.scanned) {
+  // Молчаливый ноль здесь опаснее любой уязвимости: он читается как «проверено, чисто».
+  line(`⚠️ **\`bun audit\` не отработал — проверка НЕ пройдена. Это не «уязвимостей нет».**`);
+  line();
+  line(`- причина: ${audit.note}`);
+  if (audit.textSummary) {
+    const breakdown = formatSeverities(audit.textSummary.bySeverity);
+    line(
+      `- текстовый \`bun audit\` при этом насчитал **${audit.textSummary.total}**${breakdown ? ` (${breakdown})` : ''} — разбор JSON сломан, уязвимости реальны`,
+    );
+  }
+  if (audit.planned && audit.fixed + audit.remaining > 0) {
+    line(`- \`bun audit fix --dry-run\` видит ${vulns(audit.fixed + audit.remaining)}: ещё одно подтверждение, что дерево не чистое`);
+  }
+  line();
+  line('Проверить руками и не доверять этому разделу, пока не сойдётся:');
+  line('```bash');
+  line('bun audit');
+  line('bun audit fix --dry-run --json');
+  line('```');
 } else if (audit.vulnerable.length === 0) {
   line('`bun audit`: чисто.');
+  // Второй источник знает про уязвимости — значит «чисто» получено не из данных, а из сбоя.
+  if (audit.planned && audit.fixed + audit.remaining > 0) {
+    line();
+    line(
+      `⚠️ Но \`bun audit fix --dry-run\` насчитал ${vulns(audit.fixed + audit.remaining)} — источники расходятся, перепроверить руками (\`bun audit\`).`,
+    );
+  }
 } else {
+  const breakdown = formatSeverities(audit.summary.bySeverity);
+  line(
+    `\`bun audit\`: **${vulns(audit.summary.total)}**${breakdown ? ` (${breakdown})` : ''} в ${audit.vulnerable.length} ${plural(audit.vulnerable.length, 'пакете', 'пакетах', 'пакетах')}.`,
+  );
+  line();
   for (const v of audit.vulnerable) {
     const worst = v.advisories[0];
     line(`- **${v.name}** — ${v.advisories.length} advisory, худшее: ${worst?.severity} «${worst?.title}» (${worst?.url})`);
   }
   line();
+  if (!audit.planned) {
+    line(`⚠️ План фикса не построен: ${audit.planNote} — минимально достаточные версии придётся смотреть вручную.`);
+    line();
+  }
   if (audit.fixes.length) {
     line(`\`bun audit fix --dry-run\` закрывает ${audit.fixed} из ${audit.fixed + audit.remaining}, поднимая:`);
     line();
